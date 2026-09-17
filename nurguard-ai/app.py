@@ -90,7 +90,7 @@ with tab1:
     st.header("Upload & Record Evidence")
     st.write("Upload a digital evidence file (CCTV log, message export, log file) and secure it with a tamper-evident hash.")
     
-    col1, col2 = st.columns([1])
+    col1, col2 = st.columns(2)
     
     with col1:
         officer_name = st.text_input("Collecting Officer's Name", placeholder="e.g., Inspector Ahmed Musa")
@@ -153,7 +153,7 @@ with tab2:
         selected_id, selected_name = file_options[selected_option]
         filepath = os.path.join(UPLOAD_DIR, selected_name)
         
-        col_left, col_right = st.columns([1])
+        col_left, col_right = st.columns(2)
         
         with col_left:
             st.subheader("Log Custody Transfer")
