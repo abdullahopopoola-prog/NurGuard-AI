@@ -212,8 +212,4 @@ NurGuard AI is an early-stage prototype. Possible future improvements include:
 
 ---
 
-## 📄 License
 
-This project was developed as part of the **ICSC 2026 Universities Hackathon**.
-
-See the repository for the applicable licensing and usage terms.
