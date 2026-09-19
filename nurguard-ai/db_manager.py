@@ -154,7 +154,9 @@ def secure_evidence(filepath, officer_name, db_path=DB_NAME):
         raise FileNotFoundError(f"File not found: {filepath}")
 
     filename = os.path.basename(filepath)
-    file_id = f"EVID_{int(datetime.now().timestamp())}"
+    import uuid  # add this to the imports at the top of db_manager.py
+
+    file_id = f"EVID_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:6]}"
     file_hash = calculate_sha256(filepath)
     timestamp = datetime.now().isoformat()
 
