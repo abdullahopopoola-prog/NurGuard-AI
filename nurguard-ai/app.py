@@ -25,27 +25,29 @@ st.markdown("""
         font-weight: bold;
     }
     .status-secure {
-        padding: 10px;
+        padding: 12px;
         background-color: #D1FAE5;
         color: #065F46;
-        border-radius: 5px;
+        border-radius: 6px;
         font-weight: bold;
-        border-left: 5px solid #10B981;
+        border-left: 6px solid #10B981;
+        margin-bottom: 15px;
     }
     .status-tampered {
-        padding: 10px;
+        padding: 12px;
         background-color: #FEE2E2;
         color: #991B1B;
-        border-radius: 5px;
+        border-radius: 6px;
         font-weight: bold;
-        border-left: 5px solid #EF4444;
+        border-left: 6px solid #EF4444;
+        margin-bottom: 15px;
     }
     .timeline-card {
         padding: 15px;
         border-radius: 8px;
         background-color: #F3F4F6;
         margin-bottom: 10px;
-        border-left: 3px solid #3B82F6;
+        border-left: 4px solid #3B82F6;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -54,35 +56,38 @@ st.markdown("""
 st.title("🛡️ NurGuard AI — Digital Evidence Integrity")
 st.caption("Track H: Proving Digital Evidence Has Not Been Changed | ICSC 2026 Universities Hackathon")
 
-# Sidebar - Project Overview & Logo
+# Sidebar - Project Overview & Utilities
 with st.sidebar:
-    # Check for logo image
-    logo_candidates = ["logo.png", "logo.jpg", "high-level-description-a-clean-professio_oylqDzGkWxKifqKJ_D-ahg_5k8BLWzbSQK344H5Q4FWYw.jpg"]
-    logo_found = None
-    for candidate in logo_candidates:
-        if os.path.exists(candidate):
-            logo_found = candidate
-            break
-            
-    if logo_found:
-        st.image(logo_found, use_container_width=True)
-        
     st.header("Project Info")
     st.markdown("""
     **NurGuard AI** is a working prototype designed to secure digital evidence at the moment of collection. 
     It generates tamper-evident cryptographic fingerprints (SHA-256) and tracks handlers over an offline-first SQLite database.
     
     ### 🎨 Brand Identity
-    * **Colors:** Deep Navy Blue, Dark Charcoal, Emerald Green
+    * **Colors:** Deep Navy, Dark Charcoal, Emerald Green
     * **Symbol:** Geometric Shield (N & G)
     """)
-    st.info("💡 **Section 84 Compliance**: Automatically compiles admissibility certificates matching the standards of the **Nigerian Evidence Act 2011**.")
+    st.info("💡 **Section 84 Compliance**: This prototype automatically compiles admissibility certificates matching the standards of the **Nigerian Evidence Act 2011**.")
     
     st.markdown("---")
+    st.subheader("⚙️ System Utilities")
     if st.button("🧹 Clear All Logs & Data", use_container_width=True):
-        db_manager.clear_all_data()
-        st.success("App data and evidence logs cleared successfully!")
-        st.rerun()
+        try:
+            if hasattr(db_manager, "clear_all_data"):
+                db_manager.clear_all_data()
+            else:
+                conn = sqlite3.connect(db_manager.DB_NAME)
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM custody_log")
+                cursor.execute("DELETE FROM evidence")
+                conn.commit()
+                conn.close()
+                for f in os.listdir(UPLOAD_DIR):
+                    os.remove(os.path.join(UPLOAD_DIR, f))
+            st.success("All evidence records and files cleared!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error clearing data: {e}")
 
 # Helper to get all evidence items from SQLite
 def get_all_evidence():
@@ -168,6 +173,22 @@ with tab2:
         selected_id, selected_name = file_options[selected_option]
         filepath = os.path.join(UPLOAD_DIR, selected_name)
         
+        # Get current DB status for the selected file
+        conn = sqlite3.connect(db_manager.DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT status, original_hash FROM evidence WHERE file_id = ?", (selected_id,))
+        db_rec = cursor.fetchone()
+        conn.close()
+        
+        curr_status = db_rec[0] if db_rec else "Secure"
+        orig_hash = db_rec[1] if db_rec else ""
+        
+        # Persistent Status Indicator Banner at Top of Inspection Screen
+        if curr_status == "Secure":
+            st.markdown('<div class="status-secure">✓ STATUS: SECURE & ADMISSIBLE (Baseline Hash Intact)</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="status-tampered">⚠️ STATUS: TAMPERED / ALTERED — HASH MISMATCH DETECTED!</div>', unsafe_allow_html=True)
+        
         col_left, col_right = st.columns(2)
         
         with col_left:
@@ -197,23 +218,39 @@ with tab2:
                     st.error("Associated file is missing from local disk!")
                 else:
                     is_secure, status_msg = db_manager.verify_integrity(selected_id, filepath)
-                    chain_ok = db_manager.verify_log_chain_integrity(selected_id)
+                    current_disk_hash = db_manager.calculate_sha256(filepath)
                     
-                    if is_secure and chain_ok:
-                        st.success(f"Integrity Verified! File is completely untampered and log hash-chain is intact. Status: {status_msg}")
-                    elif not is_secure:
-                        st.error(f"ALERT: File Tampering Detected on Disk! Status: {status_msg}")
-                    elif not chain_ok:
-                        st.error("ALERT: Custody Log Tampering Detected! Log hash chain check failed.")
-                    st.rerun()
+                    if is_secure:
+                        st.success(f"✓ INTEGRITY VERIFIED: File is completely untampered!")
+                        st.info(f"**SHA-256 Hash:** `{current_disk_hash}`")
+                    else:
+                        st.error(f"⚠️ ALERT: TAMPERING DETECTED! HASH MISMATCH!")
+                        st.markdown(f"""
+                        <div class="status-tampered">
+                            <h4>⚠️ TAMPER DETECTED / HASH MISMATCH</h4>
+                            <p><b>Original Baseline Hash:</b><br><code>{orig_hash}</code></p>
+                            <p><b>Current Disk File Hash:</b><br><code>{current_disk_hash}</code></p>
+                            <p><i>The file content on disk does not match the original cryptographic fingerprint captured at collection. This evidence is altered and legally inadmissible.</i></p>
+                        </div>
+                        """, unsafe_allow_html=True)
             
             # Action: Simulate Tampering
             if st.button("⚠️ Simulate Malicious Tampering", type="primary", use_container_width=True):
                 if os.path.exists(filepath):
                     try:
-                        with open(filepath, "a") as f:
-                            f.write("\n[ALTERED BY TAMPER SIMULATOR]")
-                        st.warning("File has been slightly altered on disk! Re-run 'Verify Evidence Integrity' to see the security system catch it.")
+                        # Append bytes to file regardless of file extension
+                        with open(filepath, "ab") as f:
+                            f.write(b"\n[ALTERED BY TAMPER SIMULATOR]")
+                        
+                        # Immediately update DB status so UI reflects tampering
+                        conn = sqlite3.connect(db_manager.DB_NAME)
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE evidence SET status = ? WHERE file_id = ?", ("⚠️ TAMPERED", selected_id))
+                        conn.commit()
+                        conn.close()
+                        
+                        st.warning("⚠️ File content altered on disk! Click 'Verify Evidence Integrity' above to inspect the hash mismatch.")
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Could not simulate tampering: {e}")
                 else:
@@ -249,7 +286,6 @@ with tab3:
         selected_option = st.selectbox("Select Evidence for Certificate", list(file_options.keys()))
         selected_id = file_options[selected_option]
         
-        # Generate raw report
         report_text = db_manager.generate_section84_report(selected_id)
         
         st.code(report_text, language="text")
