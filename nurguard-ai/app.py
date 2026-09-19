@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import uuid
 import streamlit as st
 from datetime import datetime
 import db_manager
@@ -102,16 +103,19 @@ with tab1:
             elif not uploaded_file:
                 st.error("Please upload a file to secure.")
             else:
-                # Save uploaded file to the local secured_files directory
-                filepath = os.path.join(UPLOAD_DIR, uploaded_file.name)
+                # Save uploaded file to disk with a unique prefix,
+                # so two evidence files with the same name never collide
+                unique_prefix = uuid.uuid4().hex[:8]
+                safe_filename = f"{unique_prefix}_{uploaded_file.name}"
+                filepath = os.path.join(UPLOAD_DIR, safe_filename)
                 with open(filepath, "wb") as f:
                     f.write(uploaded_file.getbuffer())
-                
+
                 try:
                     file_id, file_hash = db_manager.secure_evidence(filepath, officer_name)
                     st.success("Evidence Secured Successfully!")
                     st.balloons()
-                    
+
                     st.markdown(f"""
                     * **Evidence ID:** `{file_id}`
                     * **Stored Filename:** `{uploaded_file.name}`
