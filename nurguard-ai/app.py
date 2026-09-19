@@ -1,6 +1,5 @@
 import os
 import sqlite3
-import uuid
 import streamlit as st
 from datetime import datetime
 import db_manager
@@ -55,18 +54,35 @@ st.markdown("""
 st.title("🛡️ NurGuard AI — Digital Evidence Integrity")
 st.caption("Track H: Proving Digital Evidence Has Not Been Changed | ICSC 2026 Universities Hackathon")
 
-# Sidebar - Project Overview
+# Sidebar - Project Overview & Logo
 with st.sidebar:
+    # Check for logo image
+    logo_candidates = ["logo.png", "logo.jpg", "high-level-description-a-clean-professio_oylqDzGkWxKifqKJ_D-ahg_5k8BLWzbSQK344H5Q4FWYw.jpg"]
+    logo_found = None
+    for candidate in logo_candidates:
+        if os.path.exists(candidate):
+            logo_found = candidate
+            break
+            
+    if logo_found:
+        st.image(logo_found, use_container_width=True)
+        
     st.header("Project Info")
     st.markdown("""
     **NurGuard AI** is a working prototype designed to secure digital evidence at the moment of collection. 
     It generates tamper-evident cryptographic fingerprints (SHA-256) and tracks handlers over an offline-first SQLite database.
     
     ### 🎨 Brand Identity
-    * **Colors:** Deep Navy, Dark Charcoal, Emerald Green
+    * **Colors:** Deep Navy Blue, Dark Charcoal, Emerald Green
     * **Symbol:** Geometric Shield (N & G)
     """)
-    st.info("💡 **Section 84 Compliance**: This prototype automatically compiles admissibility certificates matching the standards of the **Nigerian Evidence Act 2011**.")
+    st.info("💡 **Section 84 Compliance**: Automatically compiles admissibility certificates matching the standards of the **Nigerian Evidence Act 2011**.")
+    
+    st.markdown("---")
+    if st.button("🧹 Clear All Logs & Data", use_container_width=True):
+        db_manager.clear_all_data()
+        st.success("App data and evidence logs cleared successfully!")
+        st.rerun()
 
 # Helper to get all evidence items from SQLite
 def get_all_evidence():
@@ -103,19 +119,15 @@ with tab1:
             elif not uploaded_file:
                 st.error("Please upload a file to secure.")
             else:
-                # Save uploaded file to disk with a unique prefix,
-                # so two evidence files with the same name never collide
-                unique_prefix = uuid.uuid4().hex[:8]
-                safe_filename = f"{unique_prefix}_{uploaded_file.name}"
-                filepath = os.path.join(UPLOAD_DIR, safe_filename)
+                filepath = os.path.join(UPLOAD_DIR, uploaded_file.name)
                 with open(filepath, "wb") as f:
                     f.write(uploaded_file.getbuffer())
-
+                
                 try:
                     file_id, file_hash = db_manager.secure_evidence(filepath, officer_name)
                     st.success("Evidence Secured Successfully!")
                     st.balloons()
-
+                    
                     st.markdown(f"""
                     * **Evidence ID:** `{file_id}`
                     * **Stored Filename:** `{uploaded_file.name}`
@@ -151,7 +163,6 @@ with tab2:
     if not evidence_list:
         st.info("Please secure an evidence file first in Tab 1.")
     else:
-        # Create a dropdown mapping for files
         file_options = {f"{filename} ({file_id})": (file_id, filename) for file_id, filename, _, _ in evidence_list}
         selected_option = st.selectbox("Select Evidence to Inspect", list(file_options.keys()))
         selected_id, selected_name = file_options[selected_option]
@@ -186,17 +197,20 @@ with tab2:
                     st.error("Associated file is missing from local disk!")
                 else:
                     is_secure, status_msg = db_manager.verify_integrity(selected_id, filepath)
-                    if is_secure:
-                        st.success(f"Integrity Verified! File is completely untampered. Status: {status_msg}")
-                    else:
-                        st.error(f"ALERT: Tampering Detected! Status: {status_msg}")
+                    chain_ok = db_manager.verify_log_chain_integrity(selected_id)
+                    
+                    if is_secure and chain_ok:
+                        st.success(f"Integrity Verified! File is completely untampered and log hash-chain is intact. Status: {status_msg}")
+                    elif not is_secure:
+                        st.error(f"ALERT: File Tampering Detected on Disk! Status: {status_msg}")
+                    elif not chain_ok:
+                        st.error("ALERT: Custody Log Tampering Detected! Log hash chain check failed.")
                     st.rerun()
             
             # Action: Simulate Tampering
             if st.button("⚠️ Simulate Malicious Tampering", type="primary", use_container_width=True):
                 if os.path.exists(filepath):
                     try:
-                        # Slightly alter the content of the file
                         with open(filepath, "a") as f:
                             f.write("\n[ALTERED BY TAMPER SIMULATOR]")
                         st.warning("File has been slightly altered on disk! Re-run 'Verify Evidence Integrity' to see the security system catch it.")
