@@ -1,745 +1,327 @@
 import os
 import sqlite3
+import hashlib
 import uuid
-import streamlit as st
 from datetime import datetime
-import db_manager
 
-# Ensure local directories and databases exist
-UPLOAD_DIR = "secured_files"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-db_manager.init_db()
+# Database Name
+DB_NAME = "evidence.db"
 
-# Page configuration
-st.set_page_config(
-    page_title="NurGuard AI - Digital Evidence Integrity Workbench",
-    page_icon="🛡️",
-    layout="wide"
-)
-
-# Brand colors and CSS style injection
-st.markdown("""
-<style>
-    .report-title {
-        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
-        color: #1E3A8A;
-        font-weight: bold;
-    }
-    .status-secure {
-        padding: 10px;
-        background-color: #D1FAE5;
-        color: #065F46;
-        border-radius: 5px;
-        font-weight: bold;
-        border-left: 5px solid #10B981;
-    }
-    .status-tampered {
-        padding: 10px;
-        background-color: #FEE2E2;
-        color: #991B1B;
-        border-radius: 5px;
-        font-weight: bold;
-        border-left: 5px solid #EF4444;
-    }
-    .timeline-card {
-        padding: 15px;
-        border-radius: 8px;
-        background-color: #F3F4F6;
-        margin-bottom: 10px;
-        border-left: 3px solid #3B82F6;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# App Header
-st.title("🛡️ NurGuard AI — Digital Evidence Integrity")
-st.caption("Track H: Proving Digital Evidence Has Not Been Changed | ICSC 2026 Universities Hackathon")
-
-# Sidebar - Project Overview
-with st.sidebar:
-    st.header("Project Info")
-    st.markdown("""
-    **NurGuard AI** is a working prototype designed to secure digital evidence at the moment of collection. 
-    It generates tamper-evident cryptographic fingerprints (SHA-256) and tracks handlers over an offline-first SQLite database.
-    
-    ### 🎨 Brand Identity
-    * **Colors:** Deep Navy, Dark Charcoal, Emerald Green
-    * **Symbol:** Geometric Shield (N & G)
-    """)
-    st.info("💡 **Section 84 Compliance**: This prototype automatically compiles admissibility certificates matching the standards of the **Nigerian Evidence Act 2011**.")
-
-# Helper to get all evidence items from SQLite
-def get_all_evidence():
-    conn = sqlite3.connect(db_manager.DB_NAME)
+def init_db(db_path=DB_NAME):
+    """
+    Initializes the local SQLite database and creates the necessary tables
+    for evidence metadata and chain of custody tracking.
+    """
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT file_id, filename, original_hash, status FROM evidence ORDER BY timestamp_collected DESC")
+
+    # Create Evidence table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS evidence (
+        file_id TEXT PRIMARY KEY,
+        filename TEXT NOT NULL,
+        original_hash TEXT NOT NULL,
+        timestamp_collected TEXT NOT NULL,
+        status TEXT NOT NULL
+    )
+    """)
+
+    # Create Custody Log table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS custody_log (
+        log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id TEXT,
+        handler_name TEXT NOT NULL,
+        action_taken TEXT NOT NULL,
+        action_timestamp TEXT NOT NULL,
+        current_hash TEXT NOT NULL,
+        FOREIGN KEY (file_id) REFERENCES evidence (file_id)
+    )
+    """)
+
+    conn.commit()
+
+    # --- ADDITION (not in original): make sure hash-chain columns exist ---
+    # Safe on both a brand-new database and the evidence.db already
+    # committed to the repo. Never touches existing rows.
+    _ensure_chain_columns(conn)
+    conn.commit()
+    conn.close()
+
+
+# ================================================================
+# ADDITION (not in original): hash-chain support for tamper-evident
+# custody logs. Nothing below this block changes any existing
+# function's name, parameters, or return value.
+# ================================================================
+def _ensure_chain_columns(conn):
+    """
+    Adds prev_log_hash and entry_hash columns to custody_log if they don't
+    already exist. Lets the chain feature work on databases created before
+    this change, without losing any existing rows.
+
+    NOTE: rows created BEFORE this migration have NULL entry_hash, since
+    they predate the chain feature. verify_log_chain_integrity() treats
+    those as unchained "legacy" rows rather than flagging them as
+    tampered - the chain applies going forward from here. If evidence.db
+    only has test/dummy data in it, the cleanest option is to delete it
+    once and let it regenerate fresh, so every entry is chain-protected
+    from the start.
+    """
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(custody_log)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    if "prev_log_hash" not in existing_columns:
+        cursor.execute("ALTER TABLE custody_log ADD COLUMN prev_log_hash TEXT")
+    if "entry_hash" not in existing_columns:
+        cursor.execute("ALTER TABLE custody_log ADD COLUMN entry_hash TEXT")
+
+
+def _last_log_entry_hash(cursor, file_id):
+    """Internal: entry_hash of the most recent chained log row for this
+    file_id, or 'GENESIS' if there isn't a chained entry yet."""
+    cursor.execute(
+        "SELECT entry_hash FROM custody_log WHERE file_id = ? ORDER BY log_id DESC LIMIT 1",
+        (file_id,)
+    )
+    row = cursor.fetchone()
+    return row[0] if (row and row[0]) else "GENESIS"
+
+
+def _compute_entry_hash(file_id, handler_name, action_taken, action_timestamp, current_hash, prev_hash):
+    payload = f"{file_id}|{handler_name}|{action_taken}|{action_timestamp}|{current_hash}|{prev_hash}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def verify_log_chain_integrity(file_id, db_path=DB_NAME):
+    """
+    NEW FUNCTION - does not replace or change anything existing.
+
+    Confirms the custody_log itself has not been edited or deleted after
+    the fact, by recomputing the hash chain and comparing it to what's
+    stored. Catches tampering with the LOG (e.g. someone editing a row
+    directly with SQL), which verify_integrity() cannot see, since that
+    function only checks the evidence FILE on disk.
+
+    Returns True if every chained entry checks out. Legacy rows without
+    an entry_hash (created before this feature existed) are skipped -
+    see the note in _ensure_chain_columns().
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT file_id, handler_name, action_taken, action_timestamp,
+               current_hash, prev_log_hash, entry_hash
+        FROM custody_log WHERE file_id = ? ORDER BY log_id ASC
+    """, (file_id,))
     rows = cursor.fetchall()
     conn.close()
-    return rows
 
-# Tabs for 3 UI Screens
-tab1, tab2, tab3 = st.tabs([
-    "📥 1. Upload & Secure Evidence", 
-    "⛓️ 2. Chain of Custody & Verification", 
-    "⚖️ 3. Section 84 Court Admissibility"
-])
-
-# ==========================================
-# TAB 1: UPLOAD & SECURE EVIDENCE
-# ==========================================
-with tab1:
-    st.header("Upload & Record Evidence")
-    st.write("Upload a digital evidence file (CCTV log, message export, log file) and secure it with a tamper-evident hash.")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        officer_name = st.text_input("Collecting Officer's Name", placeholder="e.g., Inspector Ahmed Musa")
-        uploaded_file = st.file_uploader("Select Evidence File", type=["txt", "csv", "log", "png", "jpg", "pdf", "mp4"])
-        
-        if st.button("🔐 Secure Evidence", use_container_width=True):
-            if not officer_name:
-                st.error("Please enter the collecting officer's name.")
-            elif not uploaded_file:
-                st.error("Please upload a file to secure.")
-            else:
-                # Save uploaded file to disk with a unique prefix,
-                # so two evidence files with the same name never collide
-                unique_prefix = uuid.uuid4().hex[:8]
-                safe_filename = f"{unique_prefix}_{uploaded_file.name}"
-                filepath = os.path.join(UPLOAD_DIR, safe_filename)
-                with open(filepath, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-
-                try:
-                    file_id, file_hash = db_manager.secure_evidence(filepath, officer_name)
-                    st.success("Evidence Secured Successfully!")
-                    st.balloons()
-
-                    st.markdown(f"""
-                    * **Evidence ID:** `{file_id}`
-                    * **Stored Filename:** `{uploaded_file.name}`
-                    * **SHA-256 Hash:** `{file_hash}`
-                    """)
-                except Exception as e:
-                    st.error(f"Error securing evidence: {e}")
-
-    with col2:
-        st.subheader("Currently Secured Files")
-        evidence_list = get_all_evidence()
-        if not evidence_list:
-            st.info("No evidence files secured yet. Use the upload panel on the left to start.")
-        else:
-            for file_id, filename, orig_hash, status in evidence_list:
-                with st.expander(f"📁 {filename} ({file_id})"):
-                    st.write(f"**Original SHA-256 Hash:** `{orig_hash}`")
-                    if status == "Secure":
-                        st.markdown('<div class="status-secure">✓ SECURE & ADMISSIBLE</div>', unsafe_allow_html=True)
-                    else:
-                        st.markdown('<div class="status-tampered">⚠️ TAMPERED / ALTERED</div>', unsafe_allow_html=True)
+    expected_prev = "GENESIS"
+    for (fid, handler, action, ts, cur_hash, prev_hash, entry_hash) in rows:
+        if entry_hash is None:
+            continue  # legacy row, predates the chain feature
+        if prev_hash != expected_prev:
+            return False
+        recomputed = _compute_entry_hash(fid, handler, action, ts, cur_hash, prev_hash)
+        if recomputed != entry_hash:
+            return False
+        expected_prev = entry_hash
+    return True
+# ================================================================
+# END ADDITION
+# ================================================================
 
 
-# ==========================================
-# TAB 2: CHAIN OF CUSTODY & VERIFICATION
-# ==========================================
-with tab2:
-    st.header("Chain of Custody Timeline")
-    st.write("Track who handled the evidence, record transfers, verify file integrity, and simulate tampering to test the system.")
-    
-    evidence_list = get_all_evidence()
-    
-    if not evidence_list:
-        st.info("Please secure an evidence file first in Tab 1.")
-    else:
-        # Create a dropdown mapping for files
-        file_options = {f"{filename} ({file_id})": (file_id, filename) for file_id, filename, _, _ in evidence_list}
-        selected_option = st.selectbox("Select Evidence to Inspect", list(file_options.keys()))
-        selected_id, selected_name = file_options[selected_option]
-        filepath = os.path.join(UPLOAD_DIR, selected_name)
-        
-        col_left, col_right = st.columns(2)
-        
-        with col_left:
-            st.subheader("Log Custody Transfer")
-            handler_name = st.text_input("Recipient / Handler Name", placeholder="e.g., Analyst Chioma Obi")
-            action_taken = st.selectbox("Action Taken", ["Viewed", "Transferred to Lab", "Analyzed", "Stored in Vault"])
-            
-            if st.button("📝 Log Transfer Action", use_container_width=True):
-                if not handler_name:
-                    st.error("Please specify who is receiving or handling the file.")
-                elif not os.path.exists(filepath):
-                    st.error(f"Associated file missing on disk: {filepath}")
-                else:
-                    try:
-                        db_manager.log_custody_action(selected_id, handler_name, action_taken, filepath)
-                        st.success(f"Successfully logged action: {action_taken}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error logging custody action: {e}")
-            
-            st.markdown("---")
-            st.subheader("🛠️ Integrity & Tampering Controls")
-            
-            # Action: Verify Integrity
-            if st.button("🔍 Verify Evidence Integrity", use_container_width=True):
-                if not os.path.exists(filepath):
-                    st.error("Associated file is missing from local disk!")
-                else:
-                    is_secure, status_msg = db_manager.verify_integrity(selected_id, filepath)
-                    if is_secure:
-                        st.success(f"Integrity Verified! File is completely untampered. Status: {status_msg}")
-                    else:
-                        st.error(f"ALERT: Tampering Detected! Status: {status_msg}")
-                    st.rerun()
-            
-            # Action: Simulate Tampering
-            if st.button("⚠️ Simulate Malicious Tampering", type="primary", use_container_width=True):
-                if os.path.exists(filepath):
-                    try:
-                        # Slightly alter the content of the file
-                        with open(filepath, "a") as f:
-                            f.write("\n[ALTERED BY TAMPER SIMULATOR]")
-                        st.warning("File has been slightly altered on disk! Re-run 'Verify Evidence Integrity' to see the security system catch it.")
-                    except Exception as e:
-                        st.error(f"Could not simulate tampering: {e}")
-                else:
-                    st.error("File is missing on disk; cannot tamper.")
-                    
-        with col_right:
-            st.subheader("Chronological Custody Trail")
-            trail = db_manager.get_custody_trail(selected_id)
-            
-            for idx, (handler, action, dt, hash_val) in enumerate(trail, 1):
-                st.markdown(f"""
-                <div class="timeline-card">
-                    <h4><b>[{idx}] {action}</b></h4>
-                    <p style='margin: 0;'>👤 <b>By:</b> {handler} | 🕒 <b>Date:</b> {dt}</p>
-                    <p style='margin: 0; font-family: monospace; font-size: 0.85em;'>🔑 <b>Hash at processing:</b> {hash_val}</p>
-                </div>
-                """, unsafe_allow_html=True)
+def calculate_sha256(filepath):
+    """
+    Generates a deterministic SHA-256 cryptographic hash of a file's binary content
+    to act as its unique digital fingerprint.
+    """
+    sha256_hash = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        # Read in chunks to prevent memory errors with large files
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
 
+def secure_evidence(filepath, officer_name, db_path=DB_NAME):
+    """
+    Records new evidence: computes its SHA-256 hash, inserts a record into
+    the evidence table as 'Secure', and logs the initial 'Collected' action.
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found: {filepath}")
 
-# ==========================================
-# TAB 3: SECTION 84 COURT ADMISSIBILITY
-# ==========================================
-with tab3:
-    st.header("Section 84 Evidence Admissibility Certificate")
-    st.write("Generate and export a print-ready legal document satisfying **Section 84 of the Nigerian Evidence Act 2011**.")
-    
-    evidence_list = get_all_evidence()
-    
-    if not evidence_list:
-        st.info("Please secure an evidence file first in Tab 1.")
-    else:
-        file_options = {f"{filename} ({file_id})": file_id for file_id, filename, _, _ in evidence_list}
-        selected_option = st.selectbox("Select Evidence for Certificate", list(file_options.keys()))
-        selected_id = file_options[selected_option]
-        
-        # Generate raw report
-        report_text = db_manager.generate_section84_report(selected_id)
-        
-        st.code(report_text, language="text")
-        
-        st.download_button(
-            label="💾 Download Admissibility Certificate (TXT)",
-            data=report_text,
-            file_name=f"section84_certificate_{selected_id}.txt",
-            mime="text/plain",
-            use_container_width=True
-        )import os
-import sqlite3
-import uuid
-import streamlit as st
-from datetime import datetime
-import db_manager
+    filename = os.path.basename(filepath)
+    file_id = f"EVID_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:6]}"
+    file_hash = calculate_sha256(filepath)
+    timestamp = datetime.now().isoformat()
 
-# Ensure local directories and databases exist
-UPLOAD_DIR = "secured_files"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-db_manager.init_db()
-
-# Page configuration
-st.set_page_config(
-    page_title="NurGuard AI - Digital Evidence Integrity Workbench",
-    page_icon="🛡️",
-    layout="wide"
-)
-
-# Brand colors and CSS style injection
-st.markdown("""
-<style>
-    .report-title {
-        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
-        color: #1E3A8A;
-        font-weight: bold;
-    }
-    .status-secure {
-        padding: 10px;
-        background-color: #D1FAE5;
-        color: #065F46;
-        border-radius: 5px;
-        font-weight: bold;
-        border-left: 5px solid #10B981;
-    }
-    .status-tampered {
-        padding: 10px;
-        background-color: #FEE2E2;
-        color: #991B1B;
-        border-radius: 5px;
-        font-weight: bold;
-        border-left: 5px solid #EF4444;
-    }
-    .timeline-card {
-        padding: 15px;
-        border-radius: 8px;
-        background-color: #F3F4F6;
-        margin-bottom: 10px;
-        border-left: 3px solid #3B82F6;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# App Header
-st.title("🛡️ NurGuard AI — Digital Evidence Integrity")
-st.caption("Track H: Proving Digital Evidence Has Not Been Changed | ICSC 2026 Universities Hackathon")
-
-# Sidebar - Project Overview
-with st.sidebar:
-    st.header("Project Info")
-    st.markdown("""
-    **NurGuard AI** is a working prototype designed to secure digital evidence at the moment of collection. 
-    It generates tamper-evident cryptographic fingerprints (SHA-256) and tracks handlers over an offline-first SQLite database.
-    
-    ### 🎨 Brand Identity
-    * **Colors:** Deep Navy, Dark Charcoal, Emerald Green
-    * **Symbol:** Geometric Shield (N & G)
-    """)
-    st.info("💡 **Section 84 Compliance**: This prototype automatically compiles admissibility certificates matching the standards of the **Nigerian Evidence Act 2011**.")
-
-# Helper to get all evidence items from SQLite
-def get_all_evidence():
-    conn = sqlite3.connect(db_manager.DB_NAME)
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT file_id, filename, original_hash, status FROM evidence ORDER BY timestamp_collected DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+    _ensure_chain_columns(conn)  # ADDITION: safety net if init_db() wasn't called first
 
-# Tabs for 3 UI Screens
-tab1, tab2, tab3 = st.tabs([
-    "📥 1. Upload & Secure Evidence", 
-    "⛓️ 2. Chain of Custody & Verification", 
-    "⚖️ 3. Section 84 Court Admissibility"
-])
+    try:
+        # Insert evidence metadata
+        cursor.execute("""
+        INSERT INTO evidence (file_id, filename, original_hash, timestamp_collected, status)
+        VALUES (?, ?, ?, ?, ?)
+        """, (file_id, filename, file_hash, timestamp, "Secure"))
 
-# ==========================================
-# TAB 1: UPLOAD & SECURE EVIDENCE
-# ==========================================
-with tab1:
-    st.header("Upload & Record Evidence")
-    st.write("Upload a digital evidence file (CCTV log, message export, log file) and secure it with a tamper-evident hash.")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        officer_name = st.text_input("Collecting Officer's Name", placeholder="e.g., Inspector Ahmed Musa")
-        uploaded_file = st.file_uploader("Select Evidence File", type=["txt", "csv", "log", "png", "jpg", "pdf", "mp4"])
-        
-        if st.button("🔐 Secure Evidence", use_container_width=True):
-            if not officer_name:
-                st.error("Please enter the collecting officer's name.")
-            elif not uploaded_file:
-                st.error("Please upload a file to secure.")
-            else:
-                # Save uploaded file to disk with a unique prefix,
-                # so two evidence files with the same name never collide
-                unique_prefix = uuid.uuid4().hex[:8]
-                safe_filename = f"{unique_prefix}_{uploaded_file.name}"
-                filepath = os.path.join(UPLOAD_DIR, safe_filename)
-                with open(filepath, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
+        # ADDITION: compute chain hash for this log entry
+        prev_hash = _last_log_entry_hash(cursor, file_id)
+        entry_hash = _compute_entry_hash(file_id, officer_name, "Collected", timestamp, file_hash, prev_hash)
 
-                try:
-                    file_id, file_hash = db_manager.secure_evidence(filepath, officer_name)
-                    st.success("Evidence Secured Successfully!")
-                    st.balloons()
+        # Log initial custody trail entry
+        cursor.execute("""
+        INSERT INTO custody_log (file_id, handler_name, action_taken, action_timestamp, current_hash, prev_log_hash, entry_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (file_id, officer_name, "Collected", timestamp, file_hash, prev_hash, entry_hash))
 
-                    st.markdown(f"""
-                    * **Evidence ID:** `{file_id}`
-                    * **Stored Filename:** `{uploaded_file.name}`
-                    * **SHA-256 Hash:** `{file_hash}`
-                    """)
-                except Exception as e:
-                    st.error(f"Error securing evidence: {e}")
+        conn.commit()
+        return file_id, file_hash
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
-    with col2:
-        st.subheader("Currently Secured Files")
-        evidence_list = get_all_evidence()
-        if not evidence_list:
-            st.info("No evidence files secured yet. Use the upload panel on the left to start.")
-        else:
-            for file_id, filename, orig_hash, status in evidence_list:
-                with st.expander(f"📁 {filename} ({file_id})"):
-                    st.write(f"**Original SHA-256 Hash:** `{orig_hash}`")
-                    if status == "Secure":
-                        st.markdown('<div class="status-secure">✓ SECURE & ADMISSIBLE</div>', unsafe_allow_html=True)
-                    else:
-                        st.markdown('<div class="status-tampered">⚠️ TAMPERED / ALTERED</div>', unsafe_allow_html=True)
+def log_custody_action(file_id, handler_name, action_taken, filepath, db_path=DB_NAME):
+    """
+    Logs an action taken on the evidence (e.g., 'Viewed', 'Transferred')
+    and recalculates the hash to guarantee integrity at the moment of handling.
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Associated file not found: {filepath}")
 
+    current_hash = calculate_sha256(filepath)
+    timestamp = datetime.now().isoformat()
 
-# ==========================================
-# TAB 2: CHAIN OF CUSTODY & VERIFICATION
-# ==========================================
-with tab2:
-    st.header("Chain of Custody Timeline")
-    st.write("Track who handled the evidence, record transfers, verify file integrity, and simulate tampering to test the system.")
-    
-    evidence_list = get_all_evidence()
-    
-    if not evidence_list:
-        st.info("Please secure an evidence file first in Tab 1.")
-    else:
-        # Create a dropdown mapping for files
-        file_options = {f"{filename} ({file_id})": (file_id, filename) for file_id, filename, _, _ in evidence_list}
-        selected_option = st.selectbox("Select Evidence to Inspect", list(file_options.keys()))
-        selected_id, selected_name = file_options[selected_option]
-        filepath = os.path.join(UPLOAD_DIR, selected_name)
-        
-        col_left, col_right = st.columns(2)
-        
-        with col_left:
-            st.subheader("Log Custody Transfer")
-            handler_name = st.text_input("Recipient / Handler Name", placeholder="e.g., Analyst Chioma Obi")
-            action_taken = st.selectbox("Action Taken", ["Viewed", "Transferred to Lab", "Analyzed", "Stored in Vault"])
-            
-            if st.button("📝 Log Transfer Action", use_container_width=True):
-                if not handler_name:
-                    st.error("Please specify who is receiving or handling the file.")
-                elif not os.path.exists(filepath):
-                    st.error(f"Associated file missing on disk: {filepath}")
-                else:
-                    try:
-                        db_manager.log_custody_action(selected_id, handler_name, action_taken, filepath)
-                        st.success(f"Successfully logged action: {action_taken}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error logging custody action: {e}")
-            
-            st.markdown("---")
-            st.subheader("🛠️ Integrity & Tampering Controls")
-            
-            # Action: Verify Integrity
-            if st.button("🔍 Verify Evidence Integrity", use_container_width=True):
-                if not os.path.exists(filepath):
-                    st.error("Associated file is missing from local disk!")
-                else:
-                    is_secure, status_msg = db_manager.verify_integrity(selected_id, filepath)
-                    if is_secure:
-                        st.success(f"Integrity Verified! File is completely untampered. Status: {status_msg}")
-                    else:
-                        st.error(f"ALERT: Tampering Detected! Status: {status_msg}")
-                    st.rerun()
-            
-            # Action: Simulate Tampering
-            if st.button("⚠️ Simulate Malicious Tampering", type="primary", use_container_width=True):
-                if os.path.exists(filepath):
-                    try:
-                        # Slightly alter the content of the file
-                        with open(filepath, "a") as f:
-                            f.write("\n[ALTERED BY TAMPER SIMULATOR]")
-                        st.warning("File has been slightly altered on disk! Re-run 'Verify Evidence Integrity' to see the security system catch it.")
-                    except Exception as e:
-                        st.error(f"Could not simulate tampering: {e}")
-                else:
-                    st.error("File is missing on disk; cannot tamper.")
-                    
-        with col_right:
-            st.subheader("Chronological Custody Trail")
-            trail = db_manager.get_custody_trail(selected_id)
-            
-            for idx, (handler, action, dt, hash_val) in enumerate(trail, 1):
-                st.markdown(f"""
-                <div class="timeline-card">
-                    <h4><b>[{idx}] {action}</b></h4>
-                    <p style='margin: 0;'>👤 <b>By:</b> {handler} | 🕒 <b>Date:</b> {dt}</p>
-                    <p style='margin: 0; font-family: monospace; font-size: 0.85em;'>🔑 <b>Hash at processing:</b> {hash_val}</p>
-                </div>
-                """, unsafe_allow_html=True)
-
-
-# ==========================================
-# TAB 3: SECTION 84 COURT ADMISSIBILITY
-# ==========================================
-with tab3:
-    st.header("Section 84 Evidence Admissibility Certificate")
-    st.write("Generate and export a print-ready legal document satisfying **Section 84 of the Nigerian Evidence Act 2011**.")
-    
-    evidence_list = get_all_evidence()
-    
-    if not evidence_list:
-        st.info("Please secure an evidence file first in Tab 1.")
-    else:
-        file_options = {f"{filename} ({file_id})": file_id for file_id, filename, _, _ in evidence_list}
-        selected_option = st.selectbox("Select Evidence for Certificate", list(file_options.keys()))
-        selected_id = file_options[selected_option]
-        
-        # Generate raw report
-        report_text = db_manager.generate_section84_report(selected_id)
-        
-        st.code(report_text, language="text")
-        
-        st.download_button(
-            label="💾 Download Admissibility Certificate (TXT)",
-            data=report_text,
-            file_name=f"section84_certificate_{selected_id}.txt",
-            mime="text/plain",
-            use_container_width=True
-        )import os
-import sqlite3
-import uuid
-import streamlit as st
-from datetime import datetime
-import db_manager
-
-# Ensure local directories and databases exist
-UPLOAD_DIR = "secured_files"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-db_manager.init_db()
-
-# Page configuration
-st.set_page_config(
-    page_title="NurGuard AI - Digital Evidence Integrity Workbench",
-    page_icon="🛡️",
-    layout="wide"
-)
-
-# Brand colors and CSS style injection
-st.markdown("""
-<style>
-    .report-title {
-        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
-        color: #1E3A8A;
-        font-weight: bold;
-    }
-    .status-secure {
-        padding: 10px;
-        background-color: #D1FAE5;
-        color: #065F46;
-        border-radius: 5px;
-        font-weight: bold;
-        border-left: 5px solid #10B981;
-    }
-    .status-tampered {
-        padding: 10px;
-        background-color: #FEE2E2;
-        color: #991B1B;
-        border-radius: 5px;
-        font-weight: bold;
-        border-left: 5px solid #EF4444;
-    }
-    .timeline-card {
-        padding: 15px;
-        border-radius: 8px;
-        background-color: #F3F4F6;
-        margin-bottom: 10px;
-        border-left: 3px solid #3B82F6;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# App Header
-st.title("🛡️ NurGuard AI — Digital Evidence Integrity")
-st.caption("Track H: Proving Digital Evidence Has Not Been Changed | ICSC 2026 Universities Hackathon")
-
-# Sidebar - Project Overview
-with st.sidebar:
-    st.header("Project Info")
-    st.markdown("""
-    **NurGuard AI** is a working prototype designed to secure digital evidence at the moment of collection. 
-    It generates tamper-evident cryptographic fingerprints (SHA-256) and tracks handlers over an offline-first SQLite database.
-    
-    ### 🎨 Brand Identity
-    * **Colors:** Deep Navy, Dark Charcoal, Emerald Green
-    * **Symbol:** Geometric Shield (N & G)
-    """)
-    st.info("💡 **Section 84 Compliance**: This prototype automatically compiles admissibility certificates matching the standards of the **Nigerian Evidence Act 2011**.")
-
-# Helper to get all evidence items from SQLite
-def get_all_evidence():
-    conn = sqlite3.connect(db_manager.DB_NAME)
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT file_id, filename, original_hash, status FROM evidence ORDER BY timestamp_collected DESC")
-    rows = cursor.fetchall()
+    _ensure_chain_columns(conn)  # ADDITION: safety net
+
+    try:
+        # Check if evidence exists
+        cursor.execute("SELECT file_id FROM evidence WHERE file_id = ?", (file_id,))
+        if not cursor.fetchone():
+            raise ValueError(f"Evidence ID {file_id} not found in database.")
+
+        # ADDITION: compute chain hash for this log entry
+        prev_hash = _last_log_entry_hash(cursor, file_id)
+        entry_hash = _compute_entry_hash(file_id, handler_name, action_taken, timestamp, current_hash, prev_hash)
+
+        cursor.execute("""
+        INSERT INTO custody_log (file_id, handler_name, action_taken, action_timestamp, current_hash, prev_log_hash, entry_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (file_id, handler_name, action_taken, timestamp, current_hash, prev_hash, entry_hash))
+
+        conn.commit()
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+def get_custody_trail(file_id, db_path=DB_NAME):
+    """
+    Retrieves the chronological audit trail of all custody actions for a file.
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT handler_name, action_taken, action_timestamp, current_hash
+    FROM custody_log
+    WHERE file_id = ?
+    ORDER BY log_id ASC
+    """, (file_id,))
+    logs = cursor.fetchall()
     conn.close()
-    return rows
+    return logs
 
-# Tabs for 3 UI Screens
-tab1, tab2, tab3 = st.tabs([
-    "📥 1. Upload & Secure Evidence", 
-    "⛓️ 2. Chain of Custody & Verification", 
-    "⚖️ 3. Section 84 Court Admissibility"
-])
+def verify_integrity(file_id, filepath, db_path=DB_NAME):
+    """
+    Verifies if the file's current hash matches the database original_hash.
+    Updates the evidence status to 'TAMPERED' if a mismatch is found.
+    """
+    if not os.path.exists(filepath):
+        return False, "File missing on disk"
 
-# ==========================================
-# TAB 1: UPLOAD & SECURE EVIDENCE
-# ==========================================
-with tab1:
-    st.header("Upload & Record Evidence")
-    st.write("Upload a digital evidence file (CCTV log, message export, log file) and secure it with a tamper-evident hash.")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        officer_name = st.text_input("Collecting Officer's Name", placeholder="e.g., Inspector Ahmed Musa")
-        uploaded_file = st.file_uploader("Select Evidence File", type=["txt", "csv", "log", "png", "jpg", "pdf", "mp4"])
-        
-        if st.button("🔐 Secure Evidence", use_container_width=True):
-            if not officer_name:
-                st.error("Please enter the collecting officer's name.")
-            elif not uploaded_file:
-                st.error("Please upload a file to secure.")
-            else:
-                # Save uploaded file to disk with a unique prefix,
-                # so two evidence files with the same name never collide
-                unique_prefix = uuid.uuid4().hex[:8]
-                safe_filename = f"{unique_prefix}_{uploaded_file.name}"
-                filepath = os.path.join(UPLOAD_DIR, safe_filename)
-                with open(filepath, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
+    current_hash = calculate_sha256(filepath)
 
-                try:
-                    file_id, file_hash = db_manager.secure_evidence(filepath, officer_name)
-                    st.success("Evidence Secured Successfully!")
-                    st.balloons()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
 
-                    st.markdown(f"""
-                    * **Evidence ID:** `{file_id}`
-                    * **Stored Filename:** `{uploaded_file.name}`
-                    * **SHA-256 Hash:** `{file_hash}`
-                    """)
-                except Exception as e:
-                    st.error(f"Error securing evidence: {e}")
+    cursor.execute("SELECT original_hash FROM evidence WHERE file_id = ?", (file_id,))
+    result = cursor.fetchone()
 
-    with col2:
-        st.subheader("Currently Secured Files")
-        evidence_list = get_all_evidence()
-        if not evidence_list:
-            st.info("No evidence files secured yet. Use the upload panel on the left to start.")
-        else:
-            for file_id, filename, orig_hash, status in evidence_list:
-                with st.expander(f"📁 {filename} ({file_id})"):
-                    st.write(f"**Original SHA-256 Hash:** `{orig_hash}`")
-                    if status == "Secure":
-                        st.markdown('<div class="status-secure">✓ SECURE & ADMISSIBLE</div>', unsafe_allow_html=True)
-                    else:
-                        st.markdown('<div class="status-tampered">⚠️ TAMPERED / ALTERED</div>', unsafe_allow_html=True)
+    if not result:
+        conn.close()
+        return False, "Evidence record not found in database"
 
+    original_hash = result[0]
 
-# ==========================================
-# TAB 2: CHAIN OF CUSTODY & VERIFICATION
-# ==========================================
-with tab2:
-    st.header("Chain of Custody Timeline")
-    st.write("Track who handled the evidence, record transfers, verify file integrity, and simulate tampering to test the system.")
-    
-    evidence_list = get_all_evidence()
-    
-    if not evidence_list:
-        st.info("Please secure an evidence file first in Tab 1.")
+    if current_hash == original_hash:
+        status_msg = "Secure"
+        is_secure = True
     else:
-        # Create a dropdown mapping for files
-        file_options = {f"{filename} ({file_id})": (file_id, filename) for file_id, filename, _, _ in evidence_list}
-        selected_option = st.selectbox("Select Evidence to Inspect", list(file_options.keys()))
-        selected_id, selected_name = file_options[selected_option]
-        filepath = os.path.join(UPLOAD_DIR, selected_name)
-        
-        col_left, col_right = st.columns(2)
-        
-        with col_left:
-            st.subheader("Log Custody Transfer")
-            handler_name = st.text_input("Recipient / Handler Name", placeholder="e.g., Analyst Chioma Obi")
-            action_taken = st.selectbox("Action Taken", ["Viewed", "Transferred to Lab", "Analyzed", "Stored in Vault"])
-            
-            if st.button("📝 Log Transfer Action", use_container_width=True):
-                if not handler_name:
-                    st.error("Please specify who is receiving or handling the file.")
-                elif not os.path.exists(filepath):
-                    st.error(f"Associated file missing on disk: {filepath}")
-                else:
-                    try:
-                        db_manager.log_custody_action(selected_id, handler_name, action_taken, filepath)
-                        st.success(f"Successfully logged action: {action_taken}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error logging custody action: {e}")
-            
-            st.markdown("---")
-            st.subheader("🛠️ Integrity & Tampering Controls")
-            
-            # Action: Verify Integrity
-            if st.button("🔍 Verify Evidence Integrity", use_container_width=True):
-                if not os.path.exists(filepath):
-                    st.error("Associated file is missing from local disk!")
-                else:
-                    is_secure, status_msg = db_manager.verify_integrity(selected_id, filepath)
-                    if is_secure:
-                        st.success(f"Integrity Verified! File is completely untampered. Status: {status_msg}")
-                    else:
-                        st.error(f"ALERT: Tampering Detected! Status: {status_msg}")
-                    st.rerun()
-            
-            # Action: Simulate Tampering
-            if st.button("⚠️ Simulate Malicious Tampering", type="primary", use_container_width=True):
-                if os.path.exists(filepath):
-                    try:
-                        # Slightly alter the content of the file
-                        with open(filepath, "a") as f:
-                            f.write("\n[ALTERED BY TAMPER SIMULATOR]")
-                        st.warning("File has been slightly altered on disk! Re-run 'Verify Evidence Integrity' to see the security system catch it.")
-                    except Exception as e:
-                        st.error(f"Could not simulate tampering: {e}")
-                else:
-                    st.error("File is missing on disk; cannot tamper.")
-                    
-        with col_right:
-            st.subheader("Chronological Custody Trail")
-            trail = db_manager.get_custody_trail(selected_id)
-            
-            for idx, (handler, action, dt, hash_val) in enumerate(trail, 1):
-                st.markdown(f"""
-                <div class="timeline-card">
-                    <h4><b>[{idx}] {action}</b></h4>
-                    <p style='margin: 0;'>👤 <b>By:</b> {handler} | 🕒 <b>Date:</b> {dt}</p>
-                    <p style='margin: 0; font-family: monospace; font-size: 0.85em;'>🔑 <b>Hash at processing:</b> {hash_val}</p>
-                </div>
-                """, unsafe_allow_html=True)
+        status_msg = "\u26a0\ufe0f TAMPERED"
+        is_secure = False
 
+        # Update status in evidence table
+        cursor.execute("UPDATE evidence SET status = ? WHERE file_id = ?", (status_msg, file_id))
+        conn.commit()
 
-# ==========================================
-# TAB 3: SECTION 84 COURT ADMISSIBILITY
-# ==========================================
-with tab3:
-    st.header("Section 84 Evidence Admissibility Certificate")
-    st.write("Generate and export a print-ready legal document satisfying **Section 84 of the Nigerian Evidence Act 2011**.")
-    
-    evidence_list = get_all_evidence()
-    
-    if not evidence_list:
-        st.info("Please secure an evidence file first in Tab 1.")
-    else:
-        file_options = {f"{filename} ({file_id})": file_id for file_id, filename, _, _ in evidence_list}
-        selected_option = st.selectbox("Select Evidence for Certificate", list(file_options.keys()))
-        selected_id = file_options[selected_option]
-        
-        # Generate raw report
-        report_text = db_manager.generate_section84_report(selected_id)
-        
-        st.code(report_text, language="text")
-        
-        st.download_button(
-            label="💾 Download Admissibility Certificate (TXT)",
-            data=report_text,
-            file_name=f"section84_certificate_{selected_id}.txt",
-            mime="text/plain",
-            use_container_width=True
-        )
+    conn.close()
+    return is_secure, status_msg
+
+def generate_section84_report(file_id, db_path=DB_NAME):
+    """
+    Generates an automated compliance report matching the legal requirements
+    of Section 84 of the Nigerian Evidence Act 2011.
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT filename, original_hash, timestamp_collected, status FROM evidence WHERE file_id = ?", (file_id,))
+    evidence = cursor.fetchone()
+
+    if not evidence:
+        conn.close()
+        return "Evidence record not found."
+
+    filename, original_hash, timestamp_collected, status = evidence
+    trail = get_custody_trail(file_id, db_path)
+
+    conn.close()
+
+    report = []
+    report.append("================================================================")
+    report.append("          SECTION 84 EVIDENCE ADMISSIBILITY CERTIFICATE         ")
+    report.append("               Pursuant to Nigerian Evidence Act 2011           ")
+    report.append("================================================================")
+    report.append(f"Evidence ID:        {file_id}")
+    report.append(f"File Name:          {filename}")
+    report.append(f"Original SHA-256:   {original_hash}")
+    report.append(f"Recorded Date/Time: {timestamp_collected}")
+    report.append(f"Current Status:     {status}")
+    report.append("----------------------------------------------------------------")
+    report.append("CHRONOLOGICAL CHAIN OF CUSTODY LOGS:")
+    for idx, (handler, action, dt, h_val) in enumerate(trail, 1):
+        report.append(f"  [{idx}] Action: {action} | By: {handler} | Date: {dt}")
+        report.append(f"      Cryptographic Fingerprint: {h_val}")
+    report.append("----------------------------------------------------------------")
+    report.append("STATUTORY COMPLIANCE DECLARATION (SECTION 84):")
+    report.append("I, the undersigned responsible officer, do hereby certify that:")
+    report.append("1. The digital device producing this record was operating properly.")
+    report.append("2. The source document was supplied in the ordinary course of business.")
+    report.append("3. The data integrity of the file is cryptographically verified.")
+    report.append("4. No unauthorized alteration has occurred since ingestion.")
+    report.append("")
+    report.append("Officer Signature: _______________________")
+    report.append("Date: _________________________________")
+    report.append("================================================================")
+
+    return "\n".join(report)
