@@ -13,7 +13,7 @@ It creates a **SHA-256 fingerprint** for a file, records basic custody informati
 
 ## 🔗 Links
 
-- **Live Demo:** https://nurguard-ai-nldwrksydlaqpq5dxxpqzp.streamlit.app/
+- **Live Demo:** https://nurguard-ai-b4bqzuhmd4s8abmr2sxfdw.streamlit.app/
 - **GitHub Repository:** https://github.com/abdullahopopoola-prog/NurGuard-AI
 
 ---
